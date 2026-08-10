@@ -841,8 +841,11 @@ static rpc_tensor serialize_tensor(const ggml_tensor *                        te
 
     result.id = reinterpret_cast<uint64_t>(tensor);
     result.type = tensor->type;
-    if (tensor->buffer && ggml_backend_buffer_is_rpc(tensor->buffer)) {
-        ggml_backend_buffer_t buffer = tensor->buffer;
+    ggml_backend_buffer_t buffer = tensor->buffer;
+    if (buffer && tensor->data && ggml_backend_buffer_is_multi_buffer(buffer)) {
+        buffer = ggml_backend_multi_buffer_get_buffer(buffer, tensor->data);
+    }
+    if (buffer && ggml_backend_buffer_is_rpc(buffer)) {
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
         if (ctx != nullptr && (cmd_queue == nullptr || ctx->cmd_queue == cmd_queue)) {
             result.buffer = ctx->remote_ptr;
@@ -1100,13 +1103,13 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
         rpc_msg_get_alloc_size_req request = {
             /*.device =*/ buft_ctx->device,
-            /*.tensor =*/ serialize_tensor(tensor),
+            /*.tensor =*/ serialize_tensor(tensor, cmd_queue),
             /*.srcs   =*/ {},
         };
 
         // .get_alloc_size could be a function of the tensor's srcs, so we must serialize them as well
         for (int i = 0; i < GGML_MAX_SRC; i++) {
-            request.srcs[i] = serialize_tensor(tensor->src[i]);
+            request.srcs[i] = serialize_tensor(tensor->src[i], cmd_queue);
         }
 
         std::string                cache_key = make_alloc_cache_key(request);
