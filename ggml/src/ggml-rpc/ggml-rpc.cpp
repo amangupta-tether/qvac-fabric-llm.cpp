@@ -83,6 +83,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_INIT,
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
+    RPC_CMD_COMM_COPY_TENSOR,
     RPC_CMD_SYNCHRONIZE,
     RPC_CMD_COUNT,
 };
@@ -241,6 +242,12 @@ struct rpc_msg_comm_init_rsp {
 
 struct rpc_msg_comm_allreduce_req {
     uint32_t   device;
+    rpc_tensor tensor;
+};
+
+struct rpc_msg_comm_copy_tensor_req {
+    uint32_t   device;
+    uint32_t   send;
     rpc_tensor tensor;
 };
 
@@ -1303,6 +1310,11 @@ static void ggml_backend_rpc_get_tensor_2d_async(ggml_backend_t backend, const g
         rpc_ctx->cmd_queue->submit_get_tensor_2d(request, data, size * n_copies, size, n_copies, stride_data));
 }
 
+static bool ggml_backend_rpc_direct_copy_tensor(ggml_backend_t      backend_src,
+                                                ggml_backend_t      backend_dst,
+                                                const ggml_tensor * src,
+                                                ggml_tensor *       dst);
+
 static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t      backend_src,
                                               ggml_backend_t      backend_dst,
                                               const ggml_tensor * src,
@@ -1329,6 +1341,10 @@ static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t      backend_src,
         bool status = dst_ctx->cmd_queue->submit_rpc_sync(RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response,
                                                           sizeof(response));
         return status && response.result;
+    }
+
+    if (std::getenv("GGML_RPC_DIRECT_COPY") != nullptr) {
+        return ggml_backend_rpc_direct_copy_tensor(backend_src, backend_dst, src, dst);
     }
 
     auto pending = std::make_shared<rpc_pending_copy>();
@@ -1475,6 +1491,7 @@ public:
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
     bool comm_allreduce(const rpc_msg_comm_allreduce_req & request);
+    bool comm_copy_tensor(const rpc_msg_comm_copy_tensor_req & request);
     bool comm_free(const rpc_msg_comm_free_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
@@ -1505,6 +1522,7 @@ private:
         size_t                  scratch_size = 0;
         std::vector<uint8_t>    send_buf;
         std::vector<uint8_t>    recv_buf;
+        std::vector<uint8_t>    copy_buf;
     };
 
     std::vector<ggml_backend_t> backends;
@@ -2321,6 +2339,43 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     return true;
 }
 
+bool rpc_server::comm_copy_tensor(const rpc_msg_comm_copy_tensor_req & request) {
+    if (request.device >= backends.size()) {
+        return false;
+    }
+    comm_state & state = comm_states[request.device];
+    if (state.peer == nullptr) {
+        GGML_LOG_ERROR("[%s] no communicator for device %u\n", __func__, request.device);
+        return false;
+    }
+
+    struct ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_is_contiguously_allocated(tensor)) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    state.copy_buf.resize(nbytes);
+    if (request.send != 0) {
+        ggml_backend_synchronize(backends[request.device]);
+        ggml_backend_tensor_get(tensor, state.copy_buf.data(), 0, nbytes);
+        return state.peer->send_data(state.copy_buf.data(), nbytes);
+    }
+    if (!state.peer->recv_data(state.copy_buf.data(), nbytes)) {
+        return false;
+    }
+    ggml_backend_tensor_set(tensor, state.copy_buf.data(), 0, nbytes);
+    return true;
+}
+
 bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (request.device >= backends.size()) {
         return false;
@@ -2776,6 +2831,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_COMM_COPY_TENSOR: {
+                rpc_msg_comm_copy_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.comm_copy_tensor(request)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_COMM_FREE: {
                 rpc_msg_comm_free_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -3144,6 +3209,61 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
     GGML_LOG_INFO("%s: pairwise communicator initialized (%s <-> %s)\n", __func__,
                   ranks[0].endpoint.c_str(), ranks[1].endpoint.c_str());
     return new ggml_backend_rpc_comm_context{std::move(ranks)};
+}
+
+static bool ggml_backend_rpc_direct_copy_tensor(ggml_backend_t      backend_src,
+                                                ggml_backend_t      backend_dst,
+                                                const ggml_tensor * src,
+                                                ggml_tensor *       dst) {
+    ggml_backend_rpc_context * src_ctx = (ggml_backend_rpc_context *) backend_src->context;
+    ggml_backend_rpc_context * dst_ctx = (ggml_backend_rpc_context *) backend_dst->context;
+
+    const std::string src_id = src_ctx->endpoint + "/" + std::to_string(src_ctx->device);
+    const std::string dst_id = dst_ctx->endpoint + "/" + std::to_string(dst_ctx->device);
+    const bool        swap   = dst_id < src_id;
+    const std::string key    = swap ? dst_id + "|" + src_id : src_id + "|" + dst_id;
+
+    struct direct_comm_entry {
+        std::weak_ptr<rpc_command_queue> rank0;
+        std::weak_ptr<rpc_command_queue> rank1;
+    };
+    static std::mutex                                        mutex;
+    static std::unordered_map<std::string, direct_comm_entry> comms;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        ggml_backend_rpc_context * rank0_ctx = swap ? dst_ctx : src_ctx;
+        ggml_backend_rpc_context * rank1_ctx = swap ? src_ctx : dst_ctx;
+        auto                       it        = comms.find(key);
+        auto                       cached0   = it != comms.end() ? it->second.rank0.lock() : nullptr;
+        auto                       cached1   = it != comms.end() ? it->second.rank1.lock() : nullptr;
+        if (cached0.get() != rank0_ctx->cmd_queue.get() || cached1.get() != rank1_ctx->cmd_queue.get()) {
+            ggml_backend_t ranks[2] = {
+                swap ? backend_dst : backend_src,
+                swap ? backend_src : backend_dst,
+            };
+            auto * comm = (ggml_backend_rpc_comm_context *) ggml_backend_rpc_comm_init(ranks, 2);
+            if (comm == nullptr) {
+                return false;
+            }
+            delete comm;
+            comms[key] = { rank0_ctx->cmd_queue, rank1_ctx->cmd_queue };
+        }
+    }
+
+    rpc_msg_comm_copy_tensor_req recv_request = {
+        /* .device = */ dst_ctx->device,
+        /* .send   = */ 0,
+        /* .tensor = */ serialize_tensor(dst, dst_ctx->cmd_queue),
+    };
+    rpc_msg_comm_copy_tensor_req send_request = {
+        /* .device = */ src_ctx->device,
+        /* .send   = */ 1,
+        /* .tensor = */ serialize_tensor(src, src_ctx->cmd_queue),
+    };
+    bool recv_ok = dst_ctx->cmd_queue->submit_rpc(RPC_CMD_COMM_COPY_TENSOR, &recv_request, sizeof(recv_request));
+    bool send_ok = src_ctx->cmd_queue->submit_rpc(RPC_CMD_COMM_COPY_TENSOR, &send_request, sizeof(send_request));
+    return recv_ok && send_ok;
 }
 
 static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tensor ** tensors) {
