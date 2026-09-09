@@ -1,4 +1,0 @@
-# RPC intentionally retains buffer types and endpoint registrations for the
-# process lifetime. Suppress only those factories, not communicator allocations.
-leak:ggml_backend_rpc_buffer_type
-leak:ggml_backend_rpc_add_server

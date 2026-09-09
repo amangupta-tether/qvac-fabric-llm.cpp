@@ -345,10 +345,6 @@ if (GGML_RPC)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test_rpc_allreduce.py
                 --server $<TARGET_FILE:ggml-rpc-server> ${ARGN})
             set_tests_properties(${name} PROPERTIES TIMEOUT 150 LABELS "rpc")
-            if (LLAMA_SANITIZE_ADDRESS OR GGML_SANITIZE_ADDRESS)
-                set_tests_properties(${name} PROPERTIES ENVIRONMENT
-                    "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/test-rpc-lsan.supp")
-            endif()
         endfunction()
         foreach(ranks 2 4 8)
             foreach(wire f32 bf16)

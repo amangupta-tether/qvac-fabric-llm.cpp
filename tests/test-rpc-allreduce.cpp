@@ -205,6 +205,36 @@ int main(int argc, char ** argv) {
         return 1;
     }
     free(comm);
+    // Cached device and buffer-type pointers outlive individual backends and
+    // communicators. Reconnect using those borrowed pointers after releasing
+    // every backend, then let LeakSanitizer check cache destruction at exit.
+    std::vector<ggml_backend_dev_t> devices;
+    std::vector<ggml_backend_buffer_type_t> buffer_types;
+    for (auto backend : backends) {
+        ggml_backend_synchronize(backend);
+        devices.push_back(ggml_backend_get_device(backend));
+        buffer_types.push_back(ggml_backend_get_default_buffer_type(backend));
+    }
+    backends.clear();
+    owners.clear();
+    for (size_t rank = 0; rank < world; rank++) {
+        ggml_backend_reg_t server = add_server(argv[rank + 1]);
+        if (!server || ggml_backend_reg_dev_get(server, 0) != devices[rank] ||
+                ggml_backend_dev_buffer_type(devices[rank]) != buffer_types[rank]) {
+            fprintf(stderr, "cached RPC metadata changed after releasing backends\n");
+            return 1;
+        }
+        owners.emplace_back(ggml_backend_dev_init(devices[rank], nullptr));
+        if (!owners.back()) {
+            return 1;
+        }
+        backends.push_back(owners.back().get());
+    }
+    comm = init(backends.data(), world);
+    if (!comm || !reduce_and_check(allreduce, comm, backends, 7, false)) {
+        return 1;
+    }
+    free(comm);
     for (auto backend : backends) {
         ggml_backend_synchronize(backend);
     }

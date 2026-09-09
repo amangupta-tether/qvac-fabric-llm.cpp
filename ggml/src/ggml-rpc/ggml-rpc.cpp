@@ -1616,14 +1616,19 @@ static ggml_backend_i ggml_backend_rpc_interface = {
 };
 
 ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
+    struct buffer_type_owner {
+        ggml_backend_rpc_buffer_type_context context;
+        ggml_backend_buffer_type             buffer_type;
+    };
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     std::string buft_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
-    // NOTE: buffer types are allocated and never freed; this is by design
-    static std::unordered_map<std::string, ggml_backend_buffer_type_t> buft_map;
+    // Callers borrow stable pointers for the cache's lifetime. Reclaim the
+    // metadata at shutdown without touching devices or making RPC calls.
+    static std::unordered_map<std::string, std::unique_ptr<buffer_type_owner>> buft_map;
     auto it = buft_map.find(buft_name);
     if (it != buft_map.end()) {
-        return it->second;
+        return &it->second->buffer_type;
     }
     auto cmd_queue = get_command_queue(endpoint);
     if (cmd_queue == nullptr) {
@@ -1632,7 +1637,8 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     }
     size_t                                 alignment = get_alignment(cmd_queue, device);
     size_t                                 max_size  = get_max_size(cmd_queue, device);
-    ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
+    auto owner = std::make_unique<buffer_type_owner>();
+    owner->context = {
         /* .endpoint  = */ endpoint,
         /* .device    = */ device,
         /* .name      = */ buft_name,
@@ -1640,12 +1646,13 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
         /* .max_size  = */ max_size
     };
     auto reg = ggml_backend_rpc_add_server(endpoint);
-    ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
+    owner->buffer_type = {
         /* .iface   = */ ggml_backend_rpc_buffer_type_interface,
         /* .device  = */ ggml_backend_reg_dev_get(reg, device),
-        /* .context = */ buft_ctx
+        /* .context = */ &owner->context
     };
-    buft_map[buft_name] = buft;
+    ggml_backend_buffer_type_t buft = &owner->buffer_type;
+    buft_map.emplace(buft_name, std::move(owner));
     return buft;
 }
 
@@ -3764,24 +3771,38 @@ bool ggml_backend_rpc_prefetch_connection(const char * endpoint) {
 }
 
 ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
-    static std::unordered_map<std::string, ggml_backend_reg_t> reg_map;
+    struct device_owner {
+        ggml_backend_rpc_device_context context;
+        ggml_backend_device             device;
+    };
+    struct reg_owner {
+        ggml_backend_rpc_reg_context                context;
+        std::vector<std::unique_ptr<device_owner>> devices;
+        ggml_backend_reg                           reg;
+    };
+    // The API exposes borrowed registry/device pointers. Keep their addresses
+    // stable while cached, and destroy all owned metadata at shutdown. These
+    // destructors do not depend on the buffer-type or connection caches.
+    static std::unordered_map<std::string, std::unique_ptr<reg_owner>> reg_map;
     static std::mutex mutex;
     static uint32_t dev_id = 0;
     std::lock_guard<std::mutex> lock(mutex);
-    if (reg_map.find(endpoint) != reg_map.end()) {
+    auto it = reg_map.find(endpoint);
+    if (it != reg_map.end()) {
         release_prefetched_command_queue(endpoint);
-        return reg_map[endpoint];
+        return &it->second->reg;
     }
     uint32_t dev_count = ggml_backend_rpc_get_device_count(endpoint);
     if (dev_count == 0) {
         return nullptr;
     }
-    ggml_backend_rpc_reg_context * ctx = new ggml_backend_rpc_reg_context;
-    ctx->name = "RPC[" + std::string(endpoint) + "]";
+    auto owner = std::make_unique<reg_owner>();
+    owner->context.name = "RPC[" + std::string(endpoint) + "]";
     for (uint32_t ind = 0; ind < dev_count; ind++) {
         std::string dev_name = "RPC" + std::to_string(dev_id);
         std::string dev_desc = std::string(endpoint);
-        ggml_backend_rpc_device_context * dev_ctx = new ggml_backend_rpc_device_context {
+        auto device = std::make_unique<device_owner>();
+        device->context = {
             /* .endpoint    = */    endpoint,
             /* .device      = */    ind,
             /* .name        = */    dev_name,
@@ -3789,20 +3810,22 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
             /* .graph_uids  = */    {},
         };
 
-        ggml_backend_dev_t dev = new ggml_backend_device {
+        device->device = {
             /* .iface   = */ ggml_backend_rpc_device_i,
             /* .reg     = */ ggml_backend_rpc_reg(),
-            /* .context = */ dev_ctx,
+            /* .context = */ &device->context,
         };
-        ctx->devices.push_back(dev);
+        owner->context.devices.push_back(&device->device);
+        owner->devices.push_back(std::move(device));
         dev_id++;
     }
-    ggml_backend_reg_t reg = new ggml_backend_reg {
+    owner->reg = {
         /* .api_version = */ GGML_BACKEND_API_VERSION,
         /* .iface       = */ ggml_backend_rpc_reg_interface,
-        /* .context     = */ ctx
+        /* .context     = */ &owner->context
     };
-    reg_map[endpoint] = reg;
+    ggml_backend_reg_t reg = &owner->reg;
+    reg_map.emplace(endpoint, std::move(owner));
     return reg;
 }
 
