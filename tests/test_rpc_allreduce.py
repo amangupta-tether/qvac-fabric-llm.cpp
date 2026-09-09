@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import logging
 import os
 from pathlib import Path
 import socket
@@ -131,7 +132,7 @@ def main():
                 for rank, (_, log) in enumerate(servers):
                     log.flush()
                     log.seek(0)
-                    print(f"--- RPC rank {rank} ---\n{log.read()}", flush=True)
+                    logging.error("--- RPC rank %d ---\n%s", rank, log.read())
                 raise
             finally:
                 for process, _ in servers:
