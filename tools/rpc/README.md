@@ -144,6 +144,8 @@ Allow the communication port through the firewall and ensure that the servers ca
 
 #### Testing direct all-reduce
 
+Graph and collective commands are queued asynchronously; synchronization and readback report deferred transport failures. While a direct communicator is active, its client dispatchers busy-poll to reduce command latency. This trades CPU time for lower dispatch latency. Set `GGML_RPC_NO_BUSY_SPIN=1` on the main host to use sleeping dispatchers for an A/B comparison. Polling stops when the last shared communicator handle is released.
+
 The local test runner starts isolated CPU RPC servers; it needs Python 3 but no GPU or model:
 
 ```bash

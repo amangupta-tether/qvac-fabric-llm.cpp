@@ -664,6 +664,8 @@ class rpc_command_queue {
     }
 
     bool submit_rpc(rpc_cmd command, const void * input, size_t input_size) {
+        // Own the payload before returning. Transport failures poison the queue
+        // and are reported by the next synchronization, readback, or submission.
         rpc_queue_cmd queue_cmd;
         queue_cmd.command = command;
         if (input_size > 0) {
@@ -673,17 +675,18 @@ class rpc_command_queue {
         return enqueue(std::move(queue_cmd));
     }
 
-    bool submit_rpc_checked(rpc_cmd command, const void * input, size_t input_size) {
-        auto          completion = std::make_shared<rpc_completion>();
-        rpc_queue_cmd queue_cmd;
-        queue_cmd.command    = command;
-        queue_cmd.completion = completion;
-        if (input_size > 0) {
-            queue_cmd.data.resize(input_size);
-            memcpy(queue_cmd.data.data(), input, input_size);
+    void busy_spin_acquire() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            busy_spin_users++;
         }
-        enqueue(std::move(queue_cmd));
-        return completion->wait();
+        cv.notify_one();
+    }
+
+    void busy_spin_release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        GGML_ASSERT(busy_spin_users > 0);
+        busy_spin_users--;
     }
 
     std::shared_ptr<rpc_completion> submit_rpc_deferred(rpc_cmd      command,
@@ -887,9 +890,22 @@ class rpc_command_queue {
             rpc_queue_cmd cmd;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [this] { return shutdown || !commands.empty(); });
+                if (busy_spin_users == 0) {
+                    cv.wait(lock, [this] { return shutdown || !commands.empty() || busy_spin_users != 0; });
+                }
                 if (shutdown && commands.empty()) {
                     return;
+                }
+                if (commands.empty()) {
+                    lock.unlock();
+#if defined(__aarch64__) && (defined(__clang__) || defined(__GNUC__))
+                    __asm__ volatile("yield" ::: "memory");
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__clang__) || defined(__GNUC__))
+                    __asm__ volatile("pause" ::: "memory");
+#else
+                    std::this_thread::yield();
+#endif
+                    continue;
                 }
                 cmd = std::move(commands.front());
                 commands.pop_front();
@@ -921,6 +937,7 @@ class rpc_command_queue {
     std::deque<rpc_queue_cmd>                 commands;
     bool                                      shutdown = false;
     bool                                      failed   = false;
+    unsigned                                  busy_spin_users = 0; // protected by mutex
     std::mutex                                submit_mutex;
     std::mutex                                alloc_cache_mutex;
     std::unordered_map<std::string, uint64_t> alloc_cache;
@@ -1473,20 +1490,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         request.uid    = cgraph->uid;
-        if (!rpc_ctx->cmd_queue->submit_rpc_checked(RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request))) {
+        if (!rpc_ctx->cmd_queue->submit_rpc(RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request))) {
             return GGML_STATUS_FAILED;
         }
     } else {
+        std::vector<uint8_t> input;
+        serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->cmd_queue, input);
+        if (!rpc_ctx->cmd_queue->submit_rpc(RPC_CMD_GRAPH_COMPUTE, input.data(), input.size())) {
+            return GGML_STATUS_FAILED;
+        }
         if (cgraph->uid != 0) {
             if (graph_uids.size() >= GRAPH_CACHE_MAX) {
                 graph_uids.clear();
             }
             graph_uids.insert(cgraph->uid);
-        }
-        std::vector<uint8_t> input;
-        serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->cmd_queue, input);
-        if (!rpc_ctx->cmd_queue->submit_rpc_checked(RPC_CMD_GRAPH_COMPUTE, input.data(), input.size())) {
-            return GGML_STATUS_FAILED;
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -3496,11 +3513,15 @@ struct ggml_backend_rpc_comm_shared_context {
     std::vector<rank_info> ranks;
     std::mutex mutex;
     uint64_t next_op_id = 0;
+    bool busy_spin = false;
 
     ~ggml_backend_rpc_comm_shared_context() {
         for (const auto & rank : ranks) {
             rpc_msg_comm_free_req request = {rank.device};
             rank.cmd_queue->submit_rpc(RPC_CMD_COMM_FREE, &request, sizeof(request));
+            if (busy_spin) {
+                rank.cmd_queue->busy_spin_release();
+            }
         }
     }
 };
@@ -3656,6 +3677,14 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
                   __func__, n_backends, round);
     auto shared = std::make_shared<ggml_backend_rpc_comm_shared_context>();
     shared->ranks = std::move(ranks);
+    // Acquire only after successful initialization, once per shared communicator.
+    // Reused handles keep polling alive until the final handle is released.
+    shared->busy_spin = std::getenv("GGML_RPC_NO_BUSY_SPIN") == nullptr;
+    if (shared->busy_spin) {
+        for (const auto & rank : shared->ranks) {
+            rank.cmd_queue->busy_spin_acquire();
+        }
+    }
     registry[key] = shared;
     return new ggml_backend_rpc_comm_context{std::move(shared)};
 }
@@ -3693,7 +3722,7 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
         request.device = shared->ranks[i].device;
         request.op_id   = op_id;
         request.tensor = serialize_tensor(tensors[i]);
-        if (!shared->ranks[i].cmd_queue->submit_rpc_checked(RPC_CMD_COMM_ALLREDUCE, &request, sizeof(request))) {
+        if (!shared->ranks[i].cmd_queue->submit_rpc(RPC_CMD_COMM_ALLREDUCE, &request, sizeof(request))) {
             if (i == 0) {
                 return false;
             }
