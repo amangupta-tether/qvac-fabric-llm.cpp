@@ -196,7 +196,7 @@ int main() {
     ggml_tensor * result_a = ggml_scale(ctx_a.get(), tensor_a, 2.0f);
     ggml_cgraph * graph    = ggml_new_graph_custom(ctx_a.get(), 16, false);
     ggml_build_forward_expand(graph, result_a);
-    graph->uid = ggml_graph_next_uid(); // exercise queued GRAPH_COMPUTE followed by GRAPH_RECOMPUTE
+    graph->uid = 1; // nonzero uid: RPC client caches the graph so queued re-dispatches exercise GRAPH_RECOMPUTE
     ggml_cgraph * foreign_graph = ggml_new_graph_custom(ctx_a.get(), 1, false);
     ggml_graph_add_node(foreign_graph, tensor_a);
 
