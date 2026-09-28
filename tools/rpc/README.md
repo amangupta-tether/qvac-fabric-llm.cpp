@@ -131,6 +131,7 @@ By default, the cache is stored in the `$HOME/.cache/llama.cpp/rpc` directory an
 On Linux systems with RoCEv2-capable NICs (e.g. Mellanox ConnectX), the RPC backend can use RDMA instead of TCP for lower latency and higher throughput. The transport is negotiated automatically -- no changes to command-line usage are required.
 
 RDMA is enabled by default when `libibverbs` is found at build time.
+After 100 ms without a completion, the transport waits for a completion event so an idle connection does not keep a CPU core busy.
 
 ### Direct all-reduce
 
@@ -144,7 +145,7 @@ Allow the communication port through the firewall and ensure that the servers ca
 
 #### Testing direct all-reduce
 
-Graph and collective commands are queued asynchronously; synchronization and readback report deferred transport failures. While a direct communicator is active, its client dispatchers busy-poll to reduce command latency. This trades CPU time for lower dispatch latency. Set `GGML_RPC_NO_BUSY_SPIN=1` on the main host to use sleeping dispatchers for an A/B comparison. Polling stops when the last shared communicator handle is released.
+Graph and collective commands are queued asynchronously; synchronization and readback report deferred transport failures. While a direct communicator is active, its client dispatchers busy-poll for up to 100 ms after a command, then sleep until the next command. Set `GGML_RPC_NO_BUSY_SPIN=1` on the main host to use sleeping dispatchers throughout for an A/B comparison.
 
 The local test runner starts isolated CPU RPC servers; it needs Python 3 but no GPU or model:
 

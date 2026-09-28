@@ -48,6 +48,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
 static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
 static constexpr size_t RDMA_GID_SIZE = 16;            // RoCE GID / IB GID is always 16 bytes
+static constexpr auto   RDMA_SPIN_TIME = std::chrono::milliseconds(100);
 using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 
 struct rdma_conn {
@@ -56,6 +57,8 @@ struct rdma_conn {
     struct ibv_cq * scq = nullptr;   // send completions
     struct ibv_cq * rcq = nullptr;   // recv completions
     struct ibv_qp * qp  = nullptr;
+    struct ibv_comp_channel * sch = nullptr;
+    struct ibv_comp_channel * rch = nullptr;
 
     void          * tx_buf = nullptr;
     struct ibv_mr * tx_mr  = nullptr;
@@ -90,6 +93,8 @@ struct rdma_conn {
         if (qp)  ibv_destroy_qp(qp);
         if (scq) ibv_destroy_cq(scq);
         if (rcq) ibv_destroy_cq(rcq);
+        if (sch) ibv_destroy_comp_channel(sch);
+        if (rch) ibv_destroy_comp_channel(rch);
         if (pd)  ibv_dealloc_pd(pd);
         if (ctx) ibv_close_device(ctx);
     }
@@ -132,6 +137,7 @@ struct socket_t::impl {
     bool rdma_probe();
     bool rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, const uint8_t * remote_gid);
     bool rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc);
+    bool rdma_wait_event(struct ibv_comp_channel * ch, std::chrono::steady_clock::time_point deadline);
     bool rdma_send(const void * data, size_t size);
     bool rdma_recv(void * data, size_t size);
 
@@ -281,8 +287,10 @@ bool socket_t::impl::rdma_probe() {
     rdma->pd = ibv_alloc_pd(ibctx);
     if (!rdma->pd) return false;
 
-    rdma->scq = ibv_create_cq(ibctx, 16, nullptr, nullptr, 0);
-    rdma->rcq = ibv_create_cq(ibctx, RDMA_RX_DEPTH + 4, nullptr, nullptr, 0);
+    rdma->sch = ibv_create_comp_channel(ibctx);
+    rdma->rch = ibv_create_comp_channel(ibctx);
+    rdma->scq = ibv_create_cq(ibctx, 16, nullptr, rdma->sch, 0);
+    rdma->rcq = ibv_create_cq(ibctx, RDMA_RX_DEPTH + 4, nullptr, rdma->rch, 0);
     if (!rdma->scq || !rdma->rcq) return false;
 
     ibv_qp_init_attr qia = {};
@@ -389,11 +397,50 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
     return true;
 }
 
+bool socket_t::impl::rdma_wait_event(struct ibv_comp_channel * ch, std::chrono::steady_clock::time_point deadline) {
+    struct pollfd pfds[2] = {
+        { ch->fd, POLLIN,    0 },
+        { fd,     POLLRDHUP, 0 },
+    };
+    while (true) {
+        int remaining_ms = -1;
+        if (deadline != std::chrono::steady_clock::time_point::max()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                GGML_LOG_ERROR("RDMA operation timed out\n");
+                return false;
+            }
+            remaining_ms = std::max(1, (int) std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+        }
+        const int n = poll(pfds, 2, remaining_ms);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) {
+            GGML_LOG_ERROR("RDMA operation timed out\n");
+            return false;
+        }
+        if (pfds[1].revents & (POLLHUP | POLLERR | POLLRDHUP | POLLNVAL)) return false;
+        if (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) return false;
+        if (pfds[0].revents & POLLIN) {
+            struct ibv_cq * ev_cq = nullptr;
+            void * ev_ctx = nullptr;
+            if (ibv_get_cq_event(ch, &ev_cq, &ev_ctx) != 0) return false;
+            ibv_ack_cq_events(ev_cq, 1);
+            return true;
+        }
+    }
+}
+
 bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
+    struct ibv_comp_channel * ch = cq == rdma->scq ? rdma->sch : rdma->rch;
     const auto deadline = timeout_ms >= 0
             ? std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms)
             : std::chrono::steady_clock::time_point::max();
-    for (uint64_t s = 0; ; s++) {
+    const auto start = std::chrono::steady_clock::now();
+    bool armed = false;
+    for (uint64_t s = 1; ; s++) {
         int n = ibv_poll_cq(cq, 1, wc);
         if (n > 0) {
             if (wc->status != IBV_WC_SUCCESS) {
@@ -403,13 +450,23 @@ bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
             return wc->status == IBV_WC_SUCCESS;
         }
         if (n < 0) return false;
-        if ((s & 0xFFF) == 0 && s > 0) {
+        if (armed) {
+            if (!rdma_wait_event(ch, deadline)) return false;
+            armed = false;
+            continue;
+        }
+        if ((s & 0x3FF) == 0) {
             if (tcp_peer_closed()) {
                 return false;
             }
-            if (std::chrono::steady_clock::now() >= deadline) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
                 GGML_LOG_ERROR("RDMA operation timed out\n");
                 return false;
+            }
+            if (ch != nullptr && now - start >= RDMA_SPIN_TIME) {
+                if (ibv_req_notify_cq(cq, 0) != 0) return false;
+                armed = true;
             }
         }
     }
