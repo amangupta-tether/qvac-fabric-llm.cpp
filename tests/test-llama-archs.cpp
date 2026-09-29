@@ -72,7 +72,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -120,6 +120,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
+            || arch == LLM_ARCH_GLM5_NEXT
             || arch == LLM_ARCH_MISTRAL4) {
         n_embd = 128;
         n_head = 1;
@@ -161,14 +162,19 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
             arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR ||
-            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3) {
+            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_GLM5_NEXT) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
         n_head_per_layer.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
             n_head_per_layer.push_back(il == 1 ? 0 : n_head);
         }
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
+        // GLM5 next KDA heads come from the uniform head count, only head_count_kv is per layer.
+        if (arch == LLM_ARCH_GLM5_NEXT) {
+            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
+        } else {
+            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
+        }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
@@ -186,10 +192,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
+            || arch == LLM_ARCH_GLM5_NEXT
             || arch == LLM_ARCH_MISTRAL4) {
-        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
+        // GLM5 next MLA is nope only, the cache row is the compressed latent alone.
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       arch == LLM_ARCH_GLM5_NEXT ? uint32_t(512) : uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
-        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       arch == LLM_ARCH_GLM5_NEXT ? uint32_t(0) : uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
     } else if (arch == LLM_ARCH_MINIMAX_M3) {
@@ -227,8 +235,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
     // indexer head count is independent of the main attention head count.
-    if (arch == LLM_ARCH_QWEN4EXP) {
+    if (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,  1.0e-6f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
@@ -264,6 +274,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
               arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(64));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,        uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, true);
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
 
@@ -462,6 +474,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
@@ -1328,6 +1341,95 @@ static int test_hadamard_contracts() {
     return 0;
 }
 
+static int test_glm5_kpool_sequences() {
+    struct selected_cells {
+        std::vector<int32_t> indices;
+    } selected;
+
+    auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
+        if (std::strncmp(tensor->name, "indexer_sel_idx-0", 17) != 0) {
+            return false;
+        }
+        if (!ask) {
+            auto & indices = static_cast<selected_cells *>(data)->indices;
+            indices.resize(ggml_nelements(tensor));
+            ggml_backend_tensor_get(tensor, indices.data(), 0, ggml_nbytes(tensor));
+        }
+        return true;
+    };
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", 12);
+    auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, {}, LLAMA_SPLIT_MODE_LAYER,
+            false, 2, true, observe, &selected);
+    auto * ctx = loaded.second.get();
+
+    struct test_token {
+        llama_token token;
+        llama_pos pos;
+        std::vector<llama_seq_id> seq_ids;
+    };
+    auto decode = [ctx](const std::vector<test_token> & entries) {
+        llama_batch batch = llama_batch_init(entries.size(), 0, 2);
+        for (size_t i = 0; i < entries.size(); ++i) {
+            common_batch_add(batch, entries[i].token, entries[i].pos, entries[i].seq_ids, i + 1 == entries.size());
+        }
+        const int rc = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        GGML_ASSERT(rc == 0);
+    };
+    auto unique_count = [&]() {
+        GGML_ASSERT(!selected.indices.empty());
+        return std::set<int32_t>(selected.indices.begin(), selected.indices.end()).size();
+    };
+
+    decode({{2, 0, {0}}, {3, 1, {0}}, {4, 2, {0}}, {5, 3, {0}}});
+    llama_memory_seq_add(llama_get_memory(ctx), 0, 2, 4, 1); // live positions 0, 1, 3, 4
+    selected.indices.clear();
+    decode({{6, 5, {0}}});
+    GGML_ASSERT(llama_memory_seq_token_count(llama_get_memory(ctx), 0) == 5);
+    GGML_ASSERT(unique_count() >= 5); // positions 0, 1, 3, 4, 5 must all be selected
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    decode({{10, 0, {0, 1}}, {11, 1, {0, 1}}, {12, 2, {0, 1}}, {13, 3, {0, 1}}});
+    decode({{20, 4, {0}}, {21, 5, {0}}, {22, 6, {0}}, {23, 7, {0}}});
+    decode({{30, 4, {1}}, {31, 5, {1}}, {32, 6, {1}}, {33, 7, {1}}});
+    selected.indices.clear();
+    decode({{40, 8, {0, 1}}});
+    GGML_ASSERT(unique_count() >= 13); // shared prefix once, both unique branches, current token
+
+    printf("GLM5 k-pool sequence edit and shared-token tests passed\n");
+    return 0;
+}
+
+static int test_glm5_invalid_metadata() {
+    struct invalid_case {
+        const char * key;
+        uint32_t value;
+    };
+    const invalid_case cases[] = {
+        {"glm5-next.nextn_predict_layers", 2},
+        {"glm5-next.attention.indexer.kpool", 0},
+        {"glm5-next.attention.indexer.top_k", 0},
+        {"glm5-next.attention.indexer.top_k", 5},
+        {"glm5-next.hyper_connection.count", 3},
+    };
+
+    for (const auto & test : cases) {
+        auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+        gguf_set_val_u32(metadata.get(), test.key, test.value);
+        auto params = llama_model_default_params();
+        size_t seed = 1234;
+        llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, params));
+        if (model) {
+            printf("FAIL: GLM5 accepted %s=%u\n", test.key, test.value);
+            return 1;
+        }
+    }
+
+    printf("GLM5 invalid metadata rejected without aborting\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
@@ -1336,6 +1438,12 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--hadamard-contracts") == 0) {
         return test_hadamard_contracts();
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-kpool-sequences") == 0) {
+        return test_glm5_kpool_sequences();
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-invalid-metadata") == 0) {
+        return test_glm5_invalid_metadata();
     }
     std::random_device rd;
 
