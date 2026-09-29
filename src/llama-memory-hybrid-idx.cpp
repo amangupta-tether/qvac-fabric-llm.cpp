@@ -142,8 +142,24 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
 
+void llama_memory_hybrid_idx::set_mtp_dsa_index_share(bool enabled) {
+    mtp_dsa_index_share = enabled;
+    mtp_dsa_selection.clear();
+}
+
+void llama_memory_hybrid_idx::set_mtp_dsa_selection(const int32_t * data, size_t size) {
+    if (data == nullptr) {
+        GGML_ASSERT(size == 0);
+        mtp_dsa_selection.clear();
+        return;
+    }
+    mtp_dsa_selection.assign(data, data + size);
+}
+
 void llama_memory_hybrid_idx::clear(bool data) {
     llama_memory_hybrid::clear(data);
+
+    mtp_dsa_selection.clear();
 
     if (mem_idx) {
         mem_idx->clear(data);
@@ -158,6 +174,7 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, p1);
+        mtp_dsa_selection.clear();
         // A suffix removal leaves every surviving pool and its cached key intact.
         mem_idx_stale |= p1 >= 0;
     }
@@ -170,6 +187,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        mtp_dsa_selection.clear();
         mem_idx_stale = true;
     }
 }
@@ -179,6 +197,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
+        mtp_dsa_selection.clear();
         mem_idx_stale = true;
     }
 }
@@ -188,6 +207,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
+        mtp_dsa_selection.clear();
         mem_idx_stale = true;
     }
 }
@@ -197,6 +217,7 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
 
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
+        mtp_dsa_selection.clear();
         mem_idx_stale = true;
     }
 }
@@ -1153,4 +1174,45 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     }
+}
+
+void llama_memory_hybrid_idx_context::set_input_mtp_dsa_selection(
+        ggml_tensor * sel, ggml_tensor * mask, bool gather, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(mem != nullptr && sel != nullptr && mask != nullptr && ubatch != nullptr);
+    GGML_ASSERT(sel->type == GGML_TYPE_I32 && mask->type == GGML_TYPE_F32);
+
+    const auto & saved = mem->get_mtp_dsa_selection();
+    const size_t width = (size_t) sel->ne[0];
+    const size_t count = (size_t) ggml_nelements(sel);
+    GGML_ASSERT(saved.size() == count && (size_t) ggml_nelements(mask) == count);
+    GGML_ASSERT(sel->ne[1] == (int64_t) ubatch->n_tokens);
+
+    const auto & st = kpool_cur();
+    const uint32_t kv_size = mem->get_mem_idx()->get_size();
+    const int32_t n_kv = (int32_t) get_idx()->get_n_kv();
+    std::vector<int32_t> mapped(count);
+    std::vector<float> valid(count);
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        GGML_ASSERT(ubatch->n_seq_id[i] == 1);
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < st.seqs.size());
+        const auto & sq = st.seqs[seq_id];
+        for (size_t j = 0; j < width; ++j) {
+            const size_t k = (size_t) i*width + j;
+            const llama_pos pos = saved[k];
+            const auto it = pos >= 0 && pos <= ubatch->pos[i] ?
+                std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(pos, 0u)) : sq.cells.end();
+            if (it != sq.cells.end() && it->first == pos) {
+                mapped[k] = (int32_t) (gather ? (int64_t) sq.strm*kv_size + it->second : it->second);
+                valid[k] = 0.0f;
+            } else {
+                mapped[k] = gather ? 0 : n_kv;
+                valid[k] = -INFINITY;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(sel, mapped.data(), 0, mapped.size()*sizeof(mapped[0]));
+    ggml_backend_tensor_set(mask, valid.data(), 0, valid.size()*sizeof(valid[0]));
 }

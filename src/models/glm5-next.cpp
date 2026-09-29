@@ -263,6 +263,9 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, gather_mask, gather, new_pool_idxs, new_pool_rep, ubatch);
+        if (reuse_sel != nullptr) {
+            mctx->set_input_mtp_dsa_selection(reuse_sel, gather_mask, gather, ubatch);
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -284,6 +287,10 @@ public:
         // The new pool path reserves one dummy slot when no pool is completed.
         res &= n_new             == mctx->get_n_kpool_new();
         res &= cache_safe        == mctx->get_kpool_cache_safe();
+        const bool share = params.cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mctx->get_mtp_dsa_index_share();
+        const bool reuse = share && mctx->get_mtp_dsa_selection_size() == (size_t) n_sel*params.ubatch.n_tokens;
+        res &= mtp_share == share;
+        res &= (reuse_sel != nullptr) == reuse;
 
         return res;
     }
@@ -294,6 +301,7 @@ public:
     ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32     [kpool - 1, n_tokens]
     ggml_tensor * gather_mask   = nullptr; // F32     [n_sel, 1, 1, n_tokens]
+    ggml_tensor * reuse_sel     = nullptr; // I32     [n_sel, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32     [kpool, n_new]   completed pools or one dummy pool
     ggml_tensor * new_pool_rep  = nullptr; // I64     [n_new]          destination rows, including the dummy row
 
@@ -303,6 +311,7 @@ public:
     uint32_t n_sel = 0;
     bool cache_safe = true;
     bool gather = false;
+    bool mtp_share = false;
     uint32_t n_kv  = 0;
 };
 
@@ -365,12 +374,17 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
             }
         }
         inp->gather = !use_cuda_sparse_fa && (int64_t) n_tokens <= max_ub && (int64_t) n_kv > n_sel;
+        inp->mtp_share = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mctx_hyb->get_mtp_dsa_index_share();
 
-        if (inp->gather) {
+        if (inp->gather || inp->mtp_share) {
             inp->gather_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_sel, 1, 1, n_tokens);
             ggml_set_input(inp->gather_mask);
             // Keep the mask allocated even when no op reads it, because set_input_kpool always fills it.
             ggml_build_forward_expand(gf, inp->gather_mask);
+        }
+        if (inp->mtp_share && mctx_hyb->get_mtp_dsa_selection_size() == (size_t) n_sel*n_tokens) {
+            inp->reuse_sel = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_sel, n_tokens);
+            ggml_set_input(inp->reuse_sel);
         }
     }
 
@@ -621,9 +635,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_pool         = inp_kpool->pool_cells->ne[0];
     const int64_t n_new          = inp_kpool->n_new;
 
-    ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
-    iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n_tokens);
-    cb(iq, "indexer_q", il);
+    ggml_tensor * iq = nullptr;
+    if (inp_kpool->reuse_sel == nullptr) {
+        iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
+        iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n_tokens);
+        cb(iq, "indexer_q", il);
+    }
 
     // Per-token key and pool gate scores, cached together
     ggml_tensor * ik = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
@@ -673,20 +690,20 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         }
     }
 
-    ggml_tensor * pooled = nullptr;
-    if (inp_kpool->cache_safe) {
-        pooled = ggml_get_rows(ctx0, pooled_all, inp_kpool->pool_cells);
-    } else {
-        GGML_ASSERT(n_new <= n_pool);
-        ggml_tensor * pad = ggml_fill(ctx0,
-                ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_indexer, n_pool - n_new), 0.0f);
-        pooled = n_new > 0 ? ggml_concat(ctx0, pooled_new, pad, 1) : pad;
-    }
-    pooled = ggml_reshape_3d(ctx0, pooled, n_embd_indexer, 1, n_pool);
-    cb(pooled, "indexer_pool_k", il);
+    ggml_tensor * sel_idx = inp_kpool->reuse_sel;
+    if (sel_idx == nullptr) {
+        ggml_tensor * pooled = nullptr;
+        if (inp_kpool->cache_safe) {
+            pooled = ggml_get_rows(ctx0, pooled_all, inp_kpool->pool_cells);
+        } else {
+            GGML_ASSERT(n_new <= n_pool);
+            ggml_tensor * pad = ggml_fill(ctx0,
+                    ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_indexer, n_pool - n_new), 0.0f);
+            pooled = n_new > 0 ? ggml_concat(ctx0, pooled_new, pad, 1) : pad;
+        }
+        pooled = ggml_reshape_3d(ctx0, pooled, n_embd_indexer, 1, n_pool);
+        cb(pooled, "indexer_pool_k", il);
 
-    ggml_tensor * sel_idx = nullptr;
-    {
         ggml_tensor * weights = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
         weights = ggml_scale(ctx0, weights, 1.0f / sqrtf(float(n_embd_indexer * n_indexer_head)));
         cb(weights, "indexer_weights", il);
@@ -730,8 +747,16 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
             // Append the incomplete tail with n_kv for missing cells.
             sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
         }
+    } else {
+        cb(sel_idx, "indexer_sel_reuse", il);
     }
     const int64_t n_sel = sel_idx->ne[0];
+
+    if (inp_kpool->mtp_share && il >= (int) hparams.n_layer() && inp_kpool->reuse_sel == nullptr) {
+        res->t_mtp_dsa_sel  = sel_idx;
+        res->t_mtp_dsa_mask = inp_kpool->gather_mask;
+        res->mtp_dsa_gather = inp_kpool->gather;
+    }
 
     // Gather returns selected cell indices and masks padding separately.
     if (inp_kpool->gather) {

@@ -1405,6 +1405,7 @@ static int test_glm5_mtp() {
     auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
     gguf_set_val_u32(metadata.get(), "glm5-next.block_count", 3);
     gguf_set_val_u32(metadata.get(), "glm5-next.nextn_predict_layers", 1);
+    gguf_set_val_bool(metadata.get(), "glm5-next.attention.indexer.index_share_mtp", true);
     const uint32_t n_head_kv[] = { 1, 0, 1 };
     gguf_set_arr_data(metadata.get(), "glm5-next.attention.head_count_kv", GGUF_TYPE_UINT32, n_head_kv, 3);
 
@@ -1425,6 +1426,18 @@ static int test_glm5_mtp() {
 
     cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     cp.ctx_other = target.get();
+    struct eval_counts { int score = 0; int attention = 0; } counts;
+    cp.cb_eval = [](ggml_tensor * tensor, bool ask, void * data) {
+        auto & counts = *static_cast<eval_counts *>(data);
+        if (ask && std::strstr(tensor->name, "indexer_score") != nullptr) {
+            ++counts.score;
+        }
+        if (ask && std::strstr(tensor->name, "mtp_attn_out") != nullptr) {
+            ++counts.attention;
+        }
+        return false;
+    };
+    cp.cb_eval_user_data = &counts;
     llama_context_ptr draft(llama_init_from_model(model.get(), cp));
     GGML_ASSERT(draft);
 
@@ -1434,6 +1447,7 @@ static int test_glm5_mtp() {
     params.draft.ctx_dft = draft.get();
     params.draft.backend_sampling = false;
     params.draft.p_min = 0.0f;
+    params.draft.n_max = 3;
     common_speculative_ptr spec(common_speculative_init(params, 1));
     GGML_ASSERT(spec);
 
@@ -1445,6 +1459,7 @@ static int test_glm5_mtp() {
     GGML_ASSERT(llama_decode(target.get(), batch) == 0);
     GGML_ASSERT(common_speculative_process(spec.get(), batch));
     llama_batch_free(batch);
+    counts = {};
 
     llama_tokens result;
     auto & dp = common_speculative_get_draft_params(spec.get(), 0);
@@ -1454,8 +1469,10 @@ static int test_glm5_mtp() {
     dp.result   = &result;
     common_speculative_draft(spec.get());
     GGML_ASSERT(!result.empty());
+    GGML_ASSERT(counts.attention >= 2);
+    GGML_ASSERT(counts.score < counts.attention);
 
-    printf("GLM5 NextN MTP graph passed\n");
+    printf("GLM5 NextN MTP graph and index sharing passed\n");
     return 0;
 }
 
