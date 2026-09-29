@@ -72,7 +72,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-invalid-metadata]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--mtp-shared|--mtp-shared-cpu|--hadamard-contracts|--qsa-unified-multiseq|--glm5-kpool-sequences|--glm5-mtp|--glm5-invalid-metadata]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1401,6 +1401,64 @@ static int test_glm5_kpool_sequences() {
     return 0;
 }
 
+static int test_glm5_mtp() {
+    auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
+    gguf_set_val_u32(metadata.get(), "glm5-next.block_count", 3);
+    gguf_set_val_u32(metadata.get(), "glm5-next.nextn_predict_layers", 1);
+    const uint32_t n_head_kv[] = { 1, 0, 1 };
+    gguf_set_arr_data(metadata.get(), "glm5-next.attention.head_count_kv", GGUF_TYPE_UINT32, n_head_kv, 3);
+
+    auto mp = llama_model_default_params();
+    mp.load_mtp = true;
+    size_t seed = 1234;
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &seed, mp));
+    GGML_ASSERT(model);
+
+    auto cp = llama_context_default_params();
+    cp.n_ctx = 128;
+    cp.n_batch = cp.n_ubatch = 8;
+    cp.n_outputs_max = cp.n_outputs_max_per_seq = 8;
+    cp.n_seq_max = 1;
+    cp.n_threads = cp.n_threads_batch = 2;
+    llama_context_ptr target(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(target);
+
+    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cp.ctx_other = target.get();
+    llama_context_ptr draft(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(draft);
+
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    params.draft.ctx_tgt = target.get();
+    params.draft.ctx_dft = draft.get();
+    params.draft.backend_sampling = false;
+    params.draft.p_min = 0.0f;
+    common_speculative_ptr spec(common_speculative_init(params, 1));
+    GGML_ASSERT(spec);
+
+    llama_batch batch = llama_batch_init(8, 0, 1);
+    for (int i = 0; i < 8; ++i) {
+        common_batch_add(batch, i, i, { 0 }, true);
+    }
+    common_speculative_begin(spec.get(), 0, {});
+    GGML_ASSERT(llama_decode(target.get(), batch) == 0);
+    GGML_ASSERT(common_speculative_process(spec.get(), batch));
+    llama_batch_free(batch);
+
+    llama_tokens result;
+    auto & dp = common_speculative_get_draft_params(spec.get(), 0);
+    dp.drafting = true;
+    dp.n_past   = 8;
+    dp.id_last  = 7;
+    dp.result   = &result;
+    common_speculative_draft(spec.get());
+    GGML_ASSERT(!result.empty());
+
+    printf("GLM5 NextN MTP graph passed\n");
+    return 0;
+}
+
 static int test_glm5_invalid_metadata() {
     struct invalid_case {
         const char * key;
@@ -1441,6 +1499,9 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-kpool-sequences") == 0) {
         return test_glm5_kpool_sequences();
+    }
+    if (argc == 2 && strcmp(argv[1], "--glm5-mtp") == 0) {
+        return test_glm5_mtp();
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-invalid-metadata") == 0) {
         return test_glm5_invalid_metadata();
