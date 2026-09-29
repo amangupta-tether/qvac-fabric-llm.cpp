@@ -109,6 +109,7 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 
 // Reuse the first MTP step's sparse attention selection at later draft steps.
 LLAMA_API bool llama_set_mtp_dsa_index_share(struct llama_context * ctx, bool enabled);
+LLAMA_API bool llama_set_mtp_dsa_capture(struct llama_context * ctx, bool enabled);
 LLAMA_API bool llama_set_mtp_dsa_selection(struct llama_context * ctx, const int32_t * data, size_t size);
 LLAMA_API const int32_t * llama_get_mtp_dsa_selection(struct llama_context * ctx, size_t * size);
 

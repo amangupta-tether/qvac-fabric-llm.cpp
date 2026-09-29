@@ -1152,7 +1152,19 @@ bool llama_context::set_mtp_dsa_index_share(bool enabled) {
         mem->set_mtp_dsa_index_share(enabled);
         sched_need_reserve = true;
     }
+    if (!enabled) {
+        mtp_dsa_capture = false;
+    }
     return enabled;
+}
+
+bool llama_context::set_mtp_dsa_capture(bool enabled) {
+    if (model.arch != LLM_ARCH_GLM5_NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || memory == nullptr) {
+        return false;
+    }
+    auto * mem = static_cast<llama_memory_hybrid_idx *>(memory.get());
+    mtp_dsa_capture = enabled && mem->get_mtp_dsa_index_share();
+    return mtp_dsa_capture;
 }
 
 bool llama_context::set_mtp_dsa_selection(const int32_t * data, size_t size) {
@@ -1171,7 +1183,7 @@ const int32_t * llama_context::get_mtp_dsa_selection(size_t * size) {
     if (size != nullptr) {
         *size = 0;
     }
-    if (mtp_dsa_sel_raw.empty() || mtp_dsa_sel_raw.size() != mtp_dsa_sel_mask.size() ||
+    if (mtp_dsa_sel_invalid || mtp_dsa_sel_raw.empty() || mtp_dsa_sel_raw.size() != mtp_dsa_sel_mask.size() ||
             mtp_dsa_sel_width == 0 || mtp_dsa_sel_raw.size() != mtp_dsa_sel_width*mtp_dsa_sel_seq.size() ||
             mtp_dsa_sel_gather.size() != mtp_dsa_sel_seq.size()) {
         return nullptr;
@@ -1975,6 +1987,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     mtp_dsa_sel.clear();
     mtp_dsa_sel_width = 0;
     mtp_dsa_sel_gather.clear();
+    mtp_dsa_sel_invalid = false;
 
     sched_reserve();
 
@@ -2107,7 +2120,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto * t_mtp_sel  = res->get_mtp_dsa_sel();
         auto * t_mtp_mask = res->get_mtp_dsa_mask();
-        if (t_mtp_sel != nullptr || t_mtp_mask != nullptr) {
+        if (mtp_dsa_capture && !mtp_dsa_sel_invalid && (t_mtp_sel != nullptr || t_mtp_mask != nullptr)) {
             GGML_ASSERT(t_mtp_sel != nullptr && t_mtp_mask != nullptr);
             GGML_ASSERT(t_mtp_sel->type == GGML_TYPE_I32 && t_mtp_mask->type == GGML_TYPE_F32);
             GGML_ASSERT(ggml_is_contiguous(t_mtp_sel) && ggml_is_contiguous(t_mtp_mask));
@@ -2122,19 +2135,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 mtp_dsa_sel_seq.resize(n_tokens_all, -1);
                 mtp_dsa_sel_gather.resize(n_tokens_all, 0);
             }
-            GGML_ASSERT(width == mtp_dsa_sel_width);
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                GGML_ASSERT(ubatch.n_seq_id[i] == 1);
-                mtp_dsa_sel_seq[(size_t) n_tokens_prev + i] = ubatch.seq_id[i][0];
-                mtp_dsa_sel_gather[(size_t) n_tokens_prev + i] = res->get_mtp_dsa_gather();
-            }
+            if (width != mtp_dsa_sel_width) {
+                // Different pool widths cannot be combined into one reusable selection.
+                mtp_dsa_sel_invalid = true;
+            } else {
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    GGML_ASSERT(ubatch.n_seq_id[i] == 1);
+                    mtp_dsa_sel_seq[(size_t) n_tokens_prev + i] = ubatch.seq_id[i][0];
+                    mtp_dsa_sel_gather[(size_t) n_tokens_prev + i] = res->get_mtp_dsa_gather();
+                }
 
-            const size_t offset = width*(size_t) n_tokens_prev;
-            ggml_backend_t backend_sel = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_sel);
-            ggml_backend_t backend_mask = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_mask);
-            GGML_ASSERT(backend_sel != nullptr && backend_mask != nullptr);
-            ggml_backend_tensor_get_async(backend_sel, t_mtp_sel, mtp_dsa_sel_raw.data() + offset, 0, ggml_nbytes(t_mtp_sel));
-            ggml_backend_tensor_get_async(backend_mask, t_mtp_mask, mtp_dsa_sel_mask.data() + offset, 0, ggml_nbytes(t_mtp_mask));
+                const size_t offset = width*(size_t) n_tokens_prev;
+                ggml_backend_t backend_sel = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_sel);
+                ggml_backend_t backend_mask = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_mask);
+                GGML_ASSERT(backend_sel != nullptr && backend_mask != nullptr);
+                ggml_backend_tensor_get_async(backend_sel, t_mtp_sel, mtp_dsa_sel_raw.data() + offset, 0, ggml_nbytes(t_mtp_sel));
+                ggml_backend_tensor_get_async(backend_mask, t_mtp_mask, mtp_dsa_sel_mask.data() + offset, 0, ggml_nbytes(t_mtp_mask));
+            }
         }
 
         if (t_embd && res->get_embd_pooled()) {
@@ -4333,6 +4350,10 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
 
 bool llama_set_mtp_dsa_index_share(llama_context * ctx, bool enabled) {
     return ctx != nullptr && ctx->set_mtp_dsa_index_share(enabled);
+}
+
+bool llama_set_mtp_dsa_capture(llama_context * ctx, bool enabled) {
+    return ctx != nullptr && ctx->set_mtp_dsa_capture(enabled);
 }
 
 bool llama_set_mtp_dsa_selection(llama_context * ctx, const int32_t * data, size_t size) {

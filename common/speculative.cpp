@@ -1435,6 +1435,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!dsa_index_share) {
             return;
         }
+        llama_set_mtp_dsa_capture(params.ctx_dft, false);
         llama_set_mtp_dsa_selection(params.ctx_dft, nullptr, 0);
         dsa_sel_width = 0;
         dsa_sel_batch.clear();
@@ -1691,14 +1692,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 reset_dsa_index_share();
             }
 
+            if (dsa_index_share && i == 0) {
+                llama_set_mtp_dsa_capture(ctx_dft, true);
+            }
+
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
             }
 
-            if (dsa_index_share && i == 0 && !capture_dsa_index_share(batch)) {
-                reset_dsa_index_share();
+            if (dsa_index_share && i == 0) {
+                const bool captured = capture_dsa_index_share(batch);
+                llama_set_mtp_dsa_capture(ctx_dft, false);
+                if (!captured) {
+                    reset_dsa_index_share();
+                }
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
