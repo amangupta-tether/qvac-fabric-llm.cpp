@@ -1320,6 +1320,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     size_t dsa_sel_width = 0;
     std::vector<std::vector<int32_t>> dsa_sel;
     std::vector<int32_t> dsa_sel_batch;
+    size_t dsa_captures = 0;
+    size_t dsa_reuse_steps = 0;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -1409,6 +1411,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (dsa_index_share) {
+            SPC_TRC("- dsa_index_share: captures=%zu, reused_steps=%zu\n", dsa_captures, dsa_reuse_steps);
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
                 continue;
@@ -1466,6 +1471,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             std::memcpy(dsa_sel[seq_id].data(), sel + (size_t) k*width, width*sizeof(int32_t));
         }
         dsa_sel_width = width;
+        ++dsa_captures;
         return true;
     }
 
@@ -1484,7 +1490,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             std::copy(dsa_sel[seq_id].begin(), dsa_sel[seq_id].end(), dsa_sel_batch.begin() + (size_t) k*dsa_sel_width);
         }
-        return llama_set_mtp_dsa_selection(params.ctx_dft, dsa_sel_batch.data(), dsa_sel_batch.size());
+        const bool staged = llama_set_mtp_dsa_selection(params.ctx_dft, dsa_sel_batch.data(), dsa_sel_batch.size());
+        dsa_reuse_steps += staged;
+        return staged;
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
