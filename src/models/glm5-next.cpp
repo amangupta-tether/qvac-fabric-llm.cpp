@@ -85,9 +85,10 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_mix_dim = (2 + hc)*hc;
 
-    // the NextN block is loaded but only used by the MTP graph.
-    // Separated trunk_only/mtp_only handling TODO with DECODER_MTP graph in the MTP follow up
-    int mtp_flags = 0;
+    const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
+    const bool trunk_only = n_layer_nextn > 0 && !ml.files.empty() && ml.get_weight(mtp_probe.c_str()) == nullptr;
+    int mtp_flags = trunk_only ? TENSOR_NOT_REQUIRED : 0;
+    mtp_ready = n_layer_nextn > 0 && !trunk_only && ml.load_mtp;
     if (!ml.load_mtp) {
         mtp_flags |= TENSOR_SKIP;
     }
@@ -208,7 +209,10 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_glm5_next::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        throw std::runtime_error("GLM5-Next NextN graph not implemented yet");
+        if (!mtp_ready) {
+            throw std::runtime_error("GLM5-Next MTP requires loaded NextN tensors");
+        }
+        return std::make_unique<graph_mtp>(*this, params);
     }
     return std::make_unique<graph>(*this, params);
 }
@@ -855,4 +859,90 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     cb(out, "attn_out", il);
 
     return out;
+}
+
+// The NextN block consumes a token embedding and the previous post-norm hidden state.
+// Unlike the trunk it has one DSA decoder layer without hyper-connections.
+llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+    : graph(model, params, no_trunk_t{}) {
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "GLM5-Next MTP supports one NextN block");
+    GGML_ASSERT(cparams.nextn_layer_offset == 0);
+
+    const int il = hparams.n_layer();
+    const auto & layer = model.layers[il];
+    GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm);
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    ggml_set_input(inp->embd);
+
+    ggml_tensor * tok_embd = ubatch.token
+        ? ggml_get_rows(ctx0, layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd, inp->tokens)
+        : inp->embd;
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+    ggml_tensor * h_embd = inp->h;
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
+    auto * inp_hyb   = build_inp_mem_hybrid_k();
+    auto * inp_attn  = inp_hyb->get_attn();
+    auto * inp_kpool = build_inp_kpool(mctx_hyb);
+    ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
+
+    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * cur = ggml_mul_mat(ctx0, layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0));
+    cb(cur, "mtp_eh_proj", il);
+
+    ggml_tensor * inpSA = cur;
+    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_attn_norm", il);
+
+    ggml_tensor * prev_sel = nullptr;
+    cur = build_dsa_layer(cur, layer, mctx_hyb, inp_attn, inp_kpool, &prev_sel, il);
+    cb(cur, "mtp_attn_out", il);
+
+    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+    cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    ggml_tensor * moe_out = build_moe_ffn(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps,
+            layer.ffn_gate_exps,
+            layer.ffn_down_exps,
+            layer.ffn_exp_probs_b,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, hparams.expert_weights_norm,
+            hparams.expert_weights_scale,
+            (llama_expert_gating_func_type) hparams.expert_gating_func,
+            il);
+
+    ggml_tensor * ffn_shexp = build_ffn(cur,
+            layer.ffn_up_shexp, nullptr, nullptr,
+            layer.ffn_gate_shexp, nullptr, nullptr,
+            layer.ffn_down_shexp, nullptr, nullptr,
+            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+
+    cur = ggml_add(ctx0, ggml_add(ctx0, moe_out, ffn_shexp), ffn_inp);
+    cb(cur, "mtp_post_ffn", il);
+
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;
+    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    cur = ggml_mul_mat(ctx0, head_w, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+    ggml_build_forward_expand(gf, cur);
 }
