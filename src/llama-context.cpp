@@ -1172,7 +1172,8 @@ const int32_t * llama_context::get_mtp_dsa_selection(size_t * size) {
         *size = 0;
     }
     if (mtp_dsa_sel_raw.empty() || mtp_dsa_sel_raw.size() != mtp_dsa_sel_mask.size() ||
-            mtp_dsa_sel_width == 0 || mtp_dsa_sel_raw.size() != mtp_dsa_sel_width*mtp_dsa_sel_seq.size()) {
+            mtp_dsa_sel_width == 0 || mtp_dsa_sel_raw.size() != mtp_dsa_sel_width*mtp_dsa_sel_seq.size() ||
+            mtp_dsa_sel_gather.size() != mtp_dsa_sel_seq.size()) {
         return nullptr;
     }
 
@@ -1186,7 +1187,7 @@ const int32_t * llama_context::get_mtp_dsa_selection(size_t * size) {
             return nullptr;
         }
         const auto & cells = idx->get_cells(seq_id);
-        const int64_t stream_base = mtp_dsa_sel_gather ? (int64_t) idx->get_stream(seq_id)*kv_size : 0;
+        const int64_t stream_base = mtp_dsa_sel_gather[row] ? (int64_t) idx->get_stream(seq_id)*kv_size : 0;
         for (size_t j = 0; j < mtp_dsa_sel_width; ++j) {
             const size_t i = row*mtp_dsa_sel_width + j;
             if (mtp_dsa_sel_mask[i] != 0.0f) {
@@ -1973,7 +1974,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     mtp_dsa_sel_seq.clear();
     mtp_dsa_sel.clear();
     mtp_dsa_sel_width = 0;
-    mtp_dsa_sel_gather = false;
+    mtp_dsa_sel_gather.clear();
 
     sched_reserve();
 
@@ -2116,15 +2117,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const size_t width = (size_t) t_mtp_sel->ne[0];
             if (mtp_dsa_sel_width == 0) {
                 mtp_dsa_sel_width = width;
-                mtp_dsa_sel_gather = res->get_mtp_dsa_gather();
                 mtp_dsa_sel_raw.resize(width*n_tokens_all);
                 mtp_dsa_sel_mask.resize(width*n_tokens_all);
                 mtp_dsa_sel_seq.resize(n_tokens_all, -1);
+                mtp_dsa_sel_gather.resize(n_tokens_all, 0);
             }
-            GGML_ASSERT(width == mtp_dsa_sel_width && mtp_dsa_sel_gather == res->get_mtp_dsa_gather());
+            GGML_ASSERT(width == mtp_dsa_sel_width);
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 GGML_ASSERT(ubatch.n_seq_id[i] == 1);
                 mtp_dsa_sel_seq[(size_t) n_tokens_prev + i] = ubatch.seq_id[i][0];
+                mtp_dsa_sel_gather[(size_t) n_tokens_prev + i] = res->get_mtp_dsa_gather();
             }
 
             const size_t offset = width*(size_t) n_tokens_prev;

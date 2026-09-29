@@ -1417,8 +1417,9 @@ static int test_glm5_mtp() {
 
     auto cp = llama_context_default_params();
     cp.n_ctx = 128;
-    cp.n_batch = cp.n_ubatch = 8;
-    cp.n_outputs_max = cp.n_outputs_max_per_seq = 8;
+    cp.n_batch = 64;
+    cp.n_ubatch = 32; // the 33-token prompt ends in a gather microbatch after a scatter microbatch
+    cp.n_outputs_max = cp.n_outputs_max_per_seq = 64;
     cp.n_seq_max = 1;
     cp.n_threads = cp.n_threads_batch = 2;
     llama_context_ptr target(llama_init_from_model(model.get(), cp));
@@ -1451,8 +1452,8 @@ static int test_glm5_mtp() {
     common_speculative_ptr spec(common_speculative_init(params, 1));
     GGML_ASSERT(spec);
 
-    llama_batch batch = llama_batch_init(8, 0, 1);
-    for (int i = 0; i < 8; ++i) {
+    llama_batch batch = llama_batch_init(64, 0, 1);
+    for (int i = 0; i < 33; ++i) {
         common_batch_add(batch, i, i, { 0 }, true);
     }
     common_speculative_begin(spec.get(), 0, {});
@@ -1464,8 +1465,8 @@ static int test_glm5_mtp() {
     llama_tokens result;
     auto & dp = common_speculative_get_draft_params(spec.get(), 0);
     dp.drafting = true;
-    dp.n_past   = 8;
-    dp.id_last  = 7;
+    dp.n_past   = 33;
+    dp.id_last  = 32;
     dp.result   = &result;
     common_speculative_draft(spec.get());
     GGML_ASSERT(!result.empty());
