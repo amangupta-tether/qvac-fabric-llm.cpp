@@ -335,7 +335,7 @@ private:
     std::vector<llama_seq_id> mtp_dsa_sel_seq;
     std::vector<int32_t> mtp_dsa_sel;
     size_t mtp_dsa_sel_width = 0;
-    bool mtp_dsa_sel_gather = false;
+    std::vector<uint8_t> mtp_dsa_sel_gather;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
