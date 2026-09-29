@@ -1460,6 +1460,8 @@ static int test_glm5_mtp() {
     GGML_ASSERT(llama_decode(target.get(), batch) == 0);
     GGML_ASSERT(common_speculative_process(spec.get(), batch));
     llama_batch_free(batch);
+    size_t n_capture = 0;
+    GGML_ASSERT(draft->get_mtp_dsa_selection(&n_capture) == nullptr && n_capture == 0);
     counts = {};
 
     llama_tokens result;
