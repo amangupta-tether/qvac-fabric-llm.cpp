@@ -88,7 +88,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
     const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
     const bool trunk_only = n_layer_nextn > 0 && !ml.files.empty() && ml.get_weight(mtp_probe.c_str()) == nullptr;
     int mtp_flags = trunk_only ? TENSOR_NOT_REQUIRED : 0;
-    mtp_ready = n_layer_nextn > 0 && !trunk_only && ml.load_mtp;
+    mtp_ready = n_layer_nextn == 1 && !trunk_only && ml.load_mtp && hparams.n_layer_dense_lead <= n_layer;
     if (!ml.load_mtp) {
         mtp_flags |= TENSOR_SKIP;
     }
@@ -210,7 +210,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
 std::unique_ptr<llm_graph_context> llama_model_glm5_next::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         if (!mtp_ready) {
-            throw std::runtime_error("GLM5-Next MTP requires loaded NextN tensors");
+            throw std::runtime_error("GLM5-Next MTP requires exactly one loaded MoE NextN layer");
         }
         return std::make_unique<graph_mtp>(*this, params);
     }
@@ -288,7 +288,7 @@ public:
         res &= n_new             == mctx->get_n_kpool_new();
         res &= cache_safe        == mctx->get_kpool_cache_safe();
         const bool share = params.cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mctx->get_mtp_dsa_index_share();
-        const bool reuse = share && mctx->get_mtp_dsa_selection_size() == (size_t) n_sel*params.ubatch.n_tokens;
+        const bool reuse = share && mctx->can_reuse_mtp_dsa_selection(n_sel, params.ubatch);
         res &= mtp_share == share;
         res &= (reuse_sel != nullptr) == reuse;
 
@@ -361,7 +361,8 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         bool use_cuda_sparse_fa = cparams.flash_attn && sparse_query_width &&
             (int64_t) n_kv >= std::max<int64_t>(4096, 2*n_gather);
         if (use_cuda_sparse_fa) {
-            for (int il = 0; il < n_layer; ++il) {
+            const bool mtp = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+            for (int il = mtp ? n_layer : 0; il < (mtp ? n_layer + 1 : n_layer); ++il) {
                 if (hparams.is_recr(il)) {
                     continue;
                 }
@@ -382,9 +383,11 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
             // Keep the mask allocated even when no op reads it, because set_input_kpool always fills it.
             ggml_build_forward_expand(gf, inp->gather_mask);
         }
-        if (inp->mtp_share && mctx_hyb->get_mtp_dsa_selection_size() == (size_t) n_sel*n_tokens) {
+        if (inp->mtp_share && mctx_hyb->can_reuse_mtp_dsa_selection(n_sel, ubatch)) {
             inp->reuse_sel = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_sel, n_tokens);
             ggml_set_input(inp->reuse_sel);
+        } else if (inp->mtp_share && mctx_hyb->has_mtp_dsa_selection()) {
+            LLAMA_LOG_DEBUG("%s: DSA index sharing fallback: selection width or sequence mismatch; recomputing indexer\n", __func__);
         }
     }
 
@@ -393,9 +396,11 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     if (n_new > 0) {
         inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_new);
         ggml_set_input(inp->new_pool_idxs);
+        ggml_build_forward_expand(gf, inp->new_pool_idxs);
         if (cache_safe) {
             inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_new);
             ggml_set_input(inp->new_pool_rep);
+            ggml_build_forward_expand(gf, inp->new_pool_rep);
         }
     }
 
@@ -748,11 +753,15 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
             sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
         }
     } else {
+        // index_share_for_mtp_iteration freezes the entire step-0 selection,
+        // including its tail. Later draft tokens deliberately do not refresh it.
         cb(sel_idx, "indexer_sel_reuse", il);
     }
     const int64_t n_sel = sel_idx->ne[0];
 
     if (inp_kpool->mtp_share && il >= (int) hparams.n_layer() && inp_kpool->reuse_sel == nullptr) {
+        // A reshape view does not protect its source from allocator reuse.
+        sel_idx = ggml_cont(ctx0, sel_idx);
         res->t_mtp_dsa_sel  = sel_idx;
         res->t_mtp_dsa_mask = inp_kpool->gather_mask;
         res->mtp_dsa_gather = inp_kpool->gather;

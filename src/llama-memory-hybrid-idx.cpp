@@ -147,13 +147,41 @@ void llama_memory_hybrid_idx::set_mtp_dsa_index_share(bool enabled) {
     mtp_dsa_selection.clear();
 }
 
-void llama_memory_hybrid_idx::set_mtp_dsa_selection(const int32_t * data, size_t size) {
+bool llama_memory_hybrid_idx::set_mtp_dsa_selection(
+        const int32_t * data, size_t size, size_t width, const llama_seq_id * seq_ids) {
+    mtp_dsa_selection.clear();
+    mtp_dsa_sequences.clear();
+    mtp_dsa_width = 0;
     if (data == nullptr) {
-        GGML_ASSERT(size == 0);
-        mtp_dsa_selection.clear();
-        return;
+        return size == 0;
     }
+    if (width == 0 || size == 0 || size % width != 0 || seq_ids == nullptr) {
+        return false;
+    }
+    const size_t rows = size / width;
+    for (size_t i = 0; i < rows; ++i) {
+        if (seq_ids[i] < 0 || (uint32_t) seq_ids[i] >= mem_idx->get_n_seq_ids() ||
+                std::find(seq_ids, seq_ids + i, seq_ids[i]) != seq_ids + i) {
+            return false;
+        }
+    }
+    mtp_dsa_width = width;
+    mtp_dsa_sequences.assign(seq_ids, seq_ids + rows);
     mtp_dsa_selection.assign(data, data + size);
+    return true;
+}
+
+bool llama_memory_hybrid_idx::can_reuse_mtp_dsa_selection(size_t width, const llama_ubatch & ubatch) const {
+    if (mtp_dsa_selection.empty() || width != mtp_dsa_width) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 ||
+                std::find(mtp_dsa_sequences.begin(), mtp_dsa_sequences.end(), ubatch.seq_id[i][0]) == mtp_dsa_sequences.end()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void llama_memory_hybrid_idx::clear(bool data) {
@@ -1184,7 +1212,7 @@ void llama_memory_hybrid_idx_context::set_input_mtp_dsa_selection(
     const auto & saved = mem->get_mtp_dsa_selection();
     const size_t width = (size_t) sel->ne[0];
     const size_t count = (size_t) ggml_nelements(sel);
-    GGML_ASSERT(saved.size() == count && (size_t) ggml_nelements(mask) == count);
+    GGML_ASSERT(mem->can_reuse_mtp_dsa_selection(width, *ubatch) && (size_t) ggml_nelements(mask) == count);
     GGML_ASSERT(sel->ne[1] == (int64_t) ubatch->n_tokens);
 
     const auto & st = kpool_cur();
@@ -1198,9 +1226,11 @@ void llama_memory_hybrid_idx_context::set_input_mtp_dsa_selection(
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
         GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < st.seqs.size());
         const auto & sq = st.seqs[seq_id];
+        const auto & seqs = mem->get_mtp_dsa_sequences();
+        const size_t row = std::find(seqs.begin(), seqs.end(), seq_id) - seqs.begin();
         for (size_t j = 0; j < width; ++j) {
             const size_t k = (size_t) i*width + j;
-            const llama_pos pos = saved[k];
+            const llama_pos pos = saved[row*width + j];
             const auto it = pos >= 0 && pos <= ubatch->pos[i] ?
                 std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(pos, 0u)) : sq.cells.end();
             if (it != sq.cells.end() && it->first == pos) {

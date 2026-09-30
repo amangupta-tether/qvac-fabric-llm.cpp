@@ -97,8 +97,8 @@ struct llama_context {
     float * get_embeddings_nextn_ith(int32_t i);
     bool set_mtp_dsa_index_share(bool enabled);
     bool set_mtp_dsa_capture(bool enabled);
-    bool set_mtp_dsa_selection(const int32_t * data, size_t size);
-    const int32_t * get_mtp_dsa_selection(size_t * size);
+    bool set_mtp_dsa_selection(const int32_t * data, size_t size, size_t width = 0, const llama_seq_id * seq_ids = nullptr);
+    const int32_t * get_mtp_dsa_selection(size_t * size, const llama_seq_id ** seq_ids = nullptr);
 
     float * get_embeddings_layer_inp(uint32_t lid);
 

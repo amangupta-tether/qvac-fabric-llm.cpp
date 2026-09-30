@@ -1167,7 +1167,7 @@ bool llama_context::set_mtp_dsa_capture(bool enabled) {
     return mtp_dsa_capture;
 }
 
-bool llama_context::set_mtp_dsa_selection(const int32_t * data, size_t size) {
+bool llama_context::set_mtp_dsa_selection(const int32_t * data, size_t size, size_t width, const llama_seq_id * seq_ids) {
     if (model.arch != LLM_ARCH_GLM5_NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || memory == nullptr) {
         return false;
     }
@@ -1175,11 +1175,13 @@ bool llama_context::set_mtp_dsa_selection(const int32_t * data, size_t size) {
     if (!mem->get_mtp_dsa_index_share()) {
         return false;
     }
-    mem->set_mtp_dsa_selection(data, size);
-    return true;
+    return mem->set_mtp_dsa_selection(data, size, width, seq_ids);
 }
 
-const int32_t * llama_context::get_mtp_dsa_selection(size_t * size) {
+const int32_t * llama_context::get_mtp_dsa_selection(size_t * size, const llama_seq_id ** seq_ids) {
+    if (seq_ids != nullptr) {
+        *seq_ids = nullptr;
+    }
     if (size != nullptr) {
         *size = 0;
     }
@@ -1216,6 +1218,9 @@ const int32_t * llama_context::get_mtp_dsa_selection(size_t * size) {
     }
     if (size != nullptr) {
         *size = mtp_dsa_sel.size();
+    }
+    if (seq_ids != nullptr) {
+        *seq_ids = mtp_dsa_sel_seq.data();
     }
     return mtp_dsa_sel.data();
 }
@@ -2140,7 +2145,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 mtp_dsa_sel_invalid = true;
             } else {
                 for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                    GGML_ASSERT(ubatch.n_seq_id[i] == 1);
+                    if (ubatch.n_seq_id[i] != 1) {
+                        mtp_dsa_sel_invalid = true;
+                        break;
+                    }
                     mtp_dsa_sel_seq[(size_t) n_tokens_prev + i] = ubatch.seq_id[i][0];
                     mtp_dsa_sel_gather[(size_t) n_tokens_prev + i] = res->get_mtp_dsa_gather();
                 }
@@ -4356,11 +4364,14 @@ bool llama_set_mtp_dsa_capture(llama_context * ctx, bool enabled) {
     return ctx != nullptr && ctx->set_mtp_dsa_capture(enabled);
 }
 
-bool llama_set_mtp_dsa_selection(llama_context * ctx, const int32_t * data, size_t size) {
-    return ctx != nullptr && ctx->set_mtp_dsa_selection(data, size);
+bool llama_set_mtp_dsa_selection(llama_context * ctx, const int32_t * data, size_t size, size_t width, const llama_seq_id * seq_ids) {
+    return ctx != nullptr && ctx->set_mtp_dsa_selection(data, size, width, seq_ids);
 }
 
-const int32_t * llama_get_mtp_dsa_selection(llama_context * ctx, size_t * size) {
+const int32_t * llama_get_mtp_dsa_selection(llama_context * ctx, size_t * size, const llama_seq_id ** seq_ids) {
+    if (seq_ids != nullptr) {
+        *seq_ids = nullptr;
+    }
     if (ctx == nullptr) {
         if (size != nullptr) {
             *size = 0;
@@ -4368,7 +4379,7 @@ const int32_t * llama_get_mtp_dsa_selection(llama_context * ctx, size_t * size) 
         return nullptr;
     }
     ctx->synchronize();
-    return ctx->get_mtp_dsa_selection(size);
+    return ctx->get_mtp_dsa_selection(size, seq_ids);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

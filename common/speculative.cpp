@@ -1321,7 +1321,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<int32_t>> dsa_sel;
     std::vector<int32_t> dsa_sel_batch;
     size_t dsa_captures = 0;
-    size_t dsa_reuse_steps = 0;
+    size_t dsa_staged_steps = 0;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
@@ -1412,7 +1412,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
         if (dsa_index_share) {
-            SPC_TRC("- dsa_index_share: captures=%zu, reused_steps=%zu\n", dsa_captures, dsa_reuse_steps);
+            SPC_TRC("- dsa_index_share: captures=%zu, staged_steps=%zu\n", dsa_captures, dsa_staged_steps);
         }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1451,7 +1451,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     bool capture_dsa_index_share(const llama_batch & current) {
         size_t n = 0;
-        const int32_t * sel = llama_get_mtp_dsa_selection(params.ctx_dft, &n);
+        const llama_seq_id * captured_seqs = nullptr;
+        const int32_t * sel = llama_get_mtp_dsa_selection(params.ctx_dft, &n, &captured_seqs);
         if (sel == nullptr || current.n_tokens <= 0 || n == 0 || n % (size_t) current.n_tokens != 0) {
             return false;
         }
@@ -1463,7 +1464,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (current.n_seq_id[k] != 1) {
                 return false;
             }
-            const llama_seq_id seq_id = current.seq_id[k][0];
+            const llama_seq_id seq_id = captured_seqs[k];
             if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !dsa_sel[seq_id].empty()) {
                 return false;
             }
@@ -1490,8 +1491,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             std::copy(dsa_sel[seq_id].begin(), dsa_sel[seq_id].end(), dsa_sel_batch.begin() + (size_t) k*dsa_sel_width);
         }
-        const bool staged = llama_set_mtp_dsa_selection(params.ctx_dft, dsa_sel_batch.data(), dsa_sel_batch.size());
-        dsa_reuse_steps += staged;
+        std::vector<llama_seq_id> seq_ids(current.n_tokens);
+        for (int32_t k = 0; k < current.n_tokens; ++k) {
+            seq_ids[k] = current.seq_id[k][0];
+        }
+        const bool staged = llama_set_mtp_dsa_selection(params.ctx_dft, dsa_sel_batch.data(), dsa_sel_batch.size(),
+                dsa_sel_width, seq_ids.data());
+        dsa_staged_steps += staged;
         return staged;
     }
 
@@ -1697,6 +1703,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // The head rewind can clear staged cache state, so stage after it.
             if (dsa_index_share && i > 0 && dsa_sel_width > 0 && !stage_dsa_index_share(batch)) {
+                SPC_TRC("%s", "DSA index sharing fallback: incompatible draft batch; recomputing indexer\n");
                 reset_dsa_index_share();
             }
 
@@ -1714,6 +1721,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const bool captured = capture_dsa_index_share(batch);
                 llama_set_mtp_dsa_capture(ctx_dft, false);
                 if (!captured) {
+                    SPC_TRC("%s", "DSA index sharing fallback: capture unavailable; recomputing indexer\n");
                     reset_dsa_index_share();
                 }
             }

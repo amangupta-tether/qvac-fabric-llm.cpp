@@ -93,7 +93,9 @@ public:
 
     void set_mtp_dsa_index_share(bool enabled);
     bool get_mtp_dsa_index_share() const { return mtp_dsa_index_share; }
-    void set_mtp_dsa_selection(const int32_t * data, size_t size);
+    bool set_mtp_dsa_selection(const int32_t * data, size_t size, size_t width, const llama_seq_id * seq_ids);
+    bool can_reuse_mtp_dsa_selection(size_t width, const llama_ubatch & ubatch) const;
+    const std::vector<llama_seq_id> & get_mtp_dsa_sequences() const { return mtp_dsa_sequences; }
     const std::vector<int32_t> & get_mtp_dsa_selection() const { return mtp_dsa_selection; }
 
     // The pooled keys persist in the idx cache across batches.
@@ -115,6 +117,8 @@ private:
     bool mem_idx_stale = false;
     bool mtp_dsa_index_share = false;
     std::vector<int32_t> mtp_dsa_selection;
+    size_t mtp_dsa_width = 0;
+    std::vector<llama_seq_id> mtp_dsa_sequences;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -164,7 +168,10 @@ public:
     uint32_t get_n_kpool_new() const; // Pool slots reserved for this ubatch; at least one for a stable decode graph.
     bool get_kpool_cache_safe() const;
     bool get_mtp_dsa_index_share() const { return mem != nullptr && mem->get_mtp_dsa_index_share(); }
-    size_t get_mtp_dsa_selection_size() const { return mem != nullptr ? mem->get_mtp_dsa_selection().size() : 0; }
+    bool has_mtp_dsa_selection() const { return mem != nullptr && !mem->get_mtp_dsa_selection().empty(); }
+    bool can_reuse_mtp_dsa_selection(size_t width, const llama_ubatch & ubatch) const {
+        return mem != nullptr && mem->can_reuse_mtp_dsa_selection(width, ubatch);
+    }
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch) const;
