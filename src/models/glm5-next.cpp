@@ -89,7 +89,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
     const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
     const bool trunk_only = n_layer_nextn > 0 && !ml.files.empty() && ml.get_weight(mtp_probe.c_str()) == nullptr;
     int mtp_flags = trunk_only ? TENSOR_NOT_REQUIRED : 0;
-    mtp_ready = n_layer_nextn == 1 && !trunk_only && ml.load_mtp && hparams.n_layer_dense_lead <= n_layer;
+    mtp_ready = n_layer_nextn == 1 && !trunk_only && ml.load_mtp && hparams.n_layer_dense_lead <= (uint32_t) n_layer;
     if (!ml.load_mtp) {
         mtp_flags |= TENSOR_SKIP;
     }
