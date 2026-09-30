@@ -20,6 +20,7 @@
 #include "../src/llama-model.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -1426,12 +1427,7 @@ static std::vector<llama_tokens> run_glm5_mtp(bool share, bool tail, bool shared
     cp.n_outputs_max = cp.n_outputs_max_per_seq = 64;
     cp.n_seq_max = n_seq;
     cp.n_threads = cp.n_threads_batch = 2;
-    llama_context_ptr target(llama_init_from_model(model.get(), cp));
-    GGML_ASSERT(target);
-
-    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-    cp.ctx_other = target.get();
-    struct eval_counts { int score = 0; int attention = 0; } counts;
+    struct eval_counts { int score = 0; int attention = 0; int finite = 0; int zero_attention = 0; } counts;
     cp.cb_eval = [](ggml_tensor * tensor, bool ask, void * data) {
         auto & counts = *static_cast<eval_counts *>(data);
         if (ask && std::strstr(tensor->name, "indexer_score") != nullptr) {
@@ -1440,9 +1436,31 @@ static std::vector<llama_tokens> run_glm5_mtp(bool share, bool tail, bool shared
         if (ask && std::strstr(tensor->name, "mtp_attn_out") != nullptr) {
             ++counts.attention;
         }
-        return false;
+        const bool attention = std::strstr(tensor->name, "kq_soft_max_gathered") != nullptr;
+        const bool check = attention || std::strstr(tensor->name, "h_nextn") != nullptr ||
+                           std::strstr(tensor->name, "result_output") != nullptr;
+        if (ask) {
+            return check;
+        }
+        if (check) {
+            GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+            std::vector<float> values(ggml_nelements(tensor));
+            ggml_backend_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
+            for (float value : values) {
+                GGML_ASSERT(std::isfinite(value));
+            }
+            if (attention && std::all_of(values.begin(), values.end(), [](float value) { return value == 0.0f; })) {
+                ++counts.zero_attention;
+            }
+            ++counts.finite;
+        }
+        return true;
     };
     cp.cb_eval_user_data = &counts;
+    llama_context_ptr target(llama_init_from_model(model.get(), cp));
+    GGML_ASSERT(target);
+    cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    cp.ctx_other = target.get();
     llama_context_ptr draft(llama_init_from_model(model.get(), cp));
     GGML_ASSERT(draft);
 
@@ -1465,6 +1483,14 @@ static std::vector<llama_tokens> run_glm5_mtp(bool share, bool tail, bool shared
         }
         common_speculative_begin(spec.get(), seq, {});
         GGML_ASSERT(llama_decode(target.get(), batch) == 0);
+        // Check the actual target rows consumed by MTP, not just greedy token IDs.
+        for (int i = 0; i < batch.n_tokens; ++i) {
+            const float * hidden = llama_get_embeddings_nextn_ith(target.get(), i);
+            GGML_ASSERT(hidden != nullptr);
+            for (int j = 0; j < llama_model_n_embd_out(model.get()); ++j) {
+                GGML_ASSERT(std::isfinite(hidden[j]));
+            }
+        }
         GGML_ASSERT(common_speculative_process(spec.get(), batch));
     }
     llama_batch_free(batch);
@@ -1474,6 +1500,9 @@ static std::vector<llama_tokens> run_glm5_mtp(bool share, bool tail, bool shared
     }
     size_t n_capture = 0;
     GGML_ASSERT(draft->get_mtp_dsa_selection(&n_capture) == nullptr && n_capture == 0);
+    if (!tail && ubatch == 1) {
+        GGML_ASSERT(counts.zero_attention > 0);
+    }
     counts = {};
 
     GGML_ASSERT(!draft->set_mtp_dsa_selection(nullptr, 5));
@@ -1516,7 +1545,8 @@ static std::vector<llama_tokens> run_glm5_mtp(bool share, bool tail, bool shared
         GGML_ASSERT(results[seq].size() == 3);
     }
     GGML_ASSERT(counts.attention >= 2);
-    GGML_ASSERT(share && ubatch > 1 ? counts.score < 2*counts.attention : counts.score > 0);
+    GGML_ASSERT(counts.finite > 0);
+    GGML_ASSERT(share ? counts.score < 2*counts.attention : counts.score > 0);
     printf("GLM5 MTP share=%d tail=%d shared_kv=%d seq=%d ub=%d: %.3f ms, score=%d attention=%d\n",
             share, tail, shared_kv, n_seq, ubatch, elapsed_ms, counts.score, counts.attention);
     if (share && shared_kv) {

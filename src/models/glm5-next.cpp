@@ -2,6 +2,7 @@
 #include "llama-memory-hybrid-idx.h"
 
 #include <stdexcept>
+#include <limits>
 
 // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
 // mHC residual streams, DeepSeek-style MoE.
@@ -867,7 +868,17 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
         ggml_tensor * kq = ggml_mul_mat(ctx0, k_g, q_g);                // [n_sel, 1, n_head, n_tokens]
         ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-        kq = ggml_soft_max_ext(ctx0, kq, inp_kpool->gather_mask, kq_scale, 0.0f);
+        ggml_tensor * mask = inp_kpool->gather_mask;
+        if (!hparams.indexer_kpool_select_tail) {
+            // Before the first complete pool, a no-tail query can have no visible keys.
+            // Keep softmax finite, then zero masked probabilities (including the whole
+            // row when it is empty). The original 0/-inf mask is retained for capture.
+            ggml_tensor * finite_mask = ggml_clamp(ctx0, mask, std::numeric_limits<float>::lowest(), 0.0f);
+            kq = ggml_soft_max_ext(ctx0, kq, finite_mask, kq_scale, 0.0f);
+            kq = ggml_mul(ctx0, kq, ggml_exp(ctx0, mask));
+        } else {
+            kq = ggml_soft_max_ext(ctx0, kq, mask, kq_scale, 0.0f);
+        }
         cb(kq, "kq_soft_max_gathered", il);
 
         ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, k_g)); // [n_sel, kv_lora_rank, 1, n_tokens]
