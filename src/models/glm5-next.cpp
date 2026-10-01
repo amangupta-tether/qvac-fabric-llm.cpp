@@ -873,7 +873,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
             // Before the first complete pool, a no-tail query can have no visible keys.
             // Keep softmax finite, then zero masked probabilities (including the whole
             // row when it is empty). The original 0/-inf mask is retained for capture.
-            ggml_tensor * finite_mask = ggml_clamp(ctx0, mask, std::numeric_limits<float>::lowest(), 0.0f);
+            // ggml_clamp is in-place: never alias the host input mask as its output.
+            ggml_tensor * finite_mask = ggml_clamp(ctx0, ggml_dup(ctx0, mask), std::numeric_limits<float>::lowest(), 0.0f);
             kq = ggml_soft_max_ext(ctx0, kq, finite_mask, kq_scale, 0.0f);
             kq = ggml_mul(ctx0, kq, ggml_exp(ctx0, mask));
         } else {
